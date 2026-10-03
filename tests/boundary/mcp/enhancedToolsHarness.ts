@@ -1,12 +1,26 @@
+import type { CallToolResult } from "@modelcontextprotocol/server";
+import {
+  jsonValueSchema,
+  type JsonValue,
+} from "../../../src/domain/jsonValue.js";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
-import { afterEach, describe, expect, it } from "vitest";
-import { PROCEDURES, emptyBounded, inventory } from "./enhancedToolsHarness.js";
-
 import type { AnalysisOperationPort } from "../../../src/application/AnalysisProvider.js";
 import { createServer } from "../../../src/server/createServer.js";
 import { observed as ok } from "../../fixtures/analysisExecution.js";
 
-const fixturePort = (): AnalysisOperationPort => ({
+export const PROCEDURES = {
+  "0x1": "_TtC7Fixture5Class",
+  "0x2": "_TtV7Fixture6Struct",
+  "0x3": "_TtP7Fixture8Protocol",
+  "0x4": "_TtO7Fixture4Enum",
+  "0x5": "_TtE7Fixture9Extension",
+  "0x6": "prefix_TtOther",
+};
+
+export const inventory = (values: Readonly<Record<string, string>>) =>
+  Object.entries(values).map(([address, value]) => ({ address, value }));
+
+export const fixturePort = (): AnalysisOperationPort => ({
   execute: (name, arguments_) => {
     switch (name) {
       case "list_procedures":
@@ -66,9 +80,6 @@ const fixturePort = (): AnalysisOperationPort => ({
         return Promise.resolve(ok(["fixture"]));
       case "list_strings":
         return Promise.resolve(ok(inventory({ "0x30": "hello" })));
-      case "search_strings":
-      case "search_procedures":
-        return Promise.resolve(ok(inventory({ "0x1": "needle" })));
       case "analyze_function":
         return Promise.resolve(
           ok({
@@ -109,15 +120,19 @@ const fixturePort = (): AnalysisOperationPort => ({
   },
 });
 
-const resources: Array<{ close(): Promise<void> }> = [];
-
-afterEach(async () => {
-  await Promise.all(
-    resources.splice(0).map(async (resource) => resource.close()),
-  );
+export const emptyBounded = () => ({
+  items: [],
+  total: 0,
+  returned: 0,
+  truncated: false,
+  next_offset: null,
 });
 
-const connect = async (analysis: AnalysisOperationPort = fixturePort()) => {
+export const resources: Array<{ close(): Promise<void> }> = [];
+
+export const connect = async (
+  analysis: AnalysisOperationPort = fixturePort(),
+) => {
   const server = createServer(analysis);
   const client = new Client({ name: "enhanced-test", version: "1.0.0" });
   const [clientTransport, serverTransport] =
@@ -128,43 +143,40 @@ const connect = async (analysis: AnalysisOperationPort = fixturePort()) => {
   return client;
 };
 
-describe("enhanced MCP input validation", () => {
-  it("lets the SDK reject misspelled tool inputs", async () => {
-    const client = await connect();
-    const valid = await client.callTool({
-      name: "trace_feature",
-      arguments: { query: "needle" },
-    });
-    expect(valid.isError).not.toBe(true);
-    const misspelled = await client.callTool({
-      name: "trace_feature",
-      arguments: { query: "needle", unrecognized_option: true },
-    });
-    expect(misspelled.isError).toBe(true);
-    expect(misspelled.structuredContent).toBeUndefined();
-    const nestedMisspelled = await client.callTool({
-      name: "analyze_function",
-      arguments: {
-        procedure: "0x1",
-        collection_offset: { commentz: 1 },
-      },
-    });
-    expect(nestedMisspelled.isError).toBe(true);
-    expect(nestedMisspelled.structuredContent).toBeUndefined();
-  });
+/** Close every client/server pair opened by `connect` in this module. */
+export const closeEnhancedToolResources = async (): Promise<void> => {
+  await Promise.all(
+    resources.splice(0).map(async (resource) => resource.close()),
+  );
+};
 
-  it("returns a typed tool error for malformed Hopper boundary values", async () => {
-    const client = await connect({
-      execute: () => Promise.resolve(ok(["not", "a", "procedure", "map"])),
-    });
-    const result = await client.callTool({
-      name: "analyze_swift_types",
-      arguments: {},
-    });
-    expect(result.isError).toBe(true);
-    const text = result.content.find((item) => item.type === "text");
-    expect(text?.type === "text" ? text.text : "").toBe(
-      JSON.stringify(result.structuredContent),
-    );
-  });
-});
+export const jsonResult = (result: CallToolResult): JsonValue => {
+  if (result.structuredContent === undefined)
+    throw new Error("Tool result omitted structured content");
+  const structured = jsonValueSchema.safeParse(result.structuredContent);
+  if (!structured.success)
+    throw new Error("Tool structured result was not JSON");
+  if (
+    typeof structured.data === "object" &&
+    structured.data !== null &&
+    !Array.isArray(structured.data) &&
+    "normalized_result" in structured.data
+  ) {
+    return structured.data.normalized_result ?? null;
+  }
+  if (
+    typeof structured.data === "object" &&
+    structured.data !== null &&
+    !Array.isArray(structured.data) &&
+    "evidence_id" in structured.data &&
+    "result" in structured.data
+  )
+    return structured.data.result ?? null;
+  const text = result.content.find((item) => item.type === "text");
+  if (text?.type !== "text")
+    throw new Error("Tool result omitted text content");
+  const decoded: unknown = JSON.parse(text.text);
+  const parsed = jsonValueSchema.safeParse(decoded);
+  if (!parsed.success) throw new Error("Tool result was not JSON");
+  return parsed.data;
+};
